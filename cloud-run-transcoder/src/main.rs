@@ -2859,16 +2859,18 @@ async fn run_ffmpeg_hls(
     ])
 }
 
-/// Remux HLS .ts files to fragmented MP4 for progressive download.
+/// Remux HLS .ts files to regular MP4 with faststart for progressive download.
 /// Video is copied without re-encoding. Audio is re-encoded to AAC-LC
 /// because the ADTS-to-ASC bitstream filter produces invalid headers.
+/// Uses regular MP4 (not fragmented) with moov at front — same approach as
+/// TikTok/Instagram for short-form video delivery.
 async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
     for variant in &["stream_720p", "stream_480p"] {
         let ts_path = hls_dir.join(format!("{}.ts", variant));
         let mp4_path = hls_dir.join(format!("{}.mp4", variant));
 
         if !ts_path.exists() {
-            warn!("Skipping fMP4 remux: {} not found", ts_path.display());
+            warn!("Skipping MP4 remux: {} not found", ts_path.display());
             continue;
         }
 
@@ -2880,7 +2882,7 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-b:a", "128k",
-                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                "-movflags", "+faststart",
                 &mp4_path.to_string_lossy(),
             ])
             .output()
@@ -2888,11 +2890,11 @@ async fn remux_ts_to_fmp4(hls_dir: &Path) -> Result<()> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("fMP4 remux failed for {}: {}", variant, stderr);
+            warn!("MP4 remux failed for {}: {}", variant, stderr);
             continue;
         }
 
-        info!("Remuxed {} to fMP4", variant);
+        info!("Remuxed {} to MP4", variant);
     }
 
     Ok(())
