@@ -1388,3 +1388,167 @@ pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<
         }
     }
 }
+
+/// Backend name for Funnelcake API
+const FUNNELCAKE_BACKEND: &str = "funnelcake_api";
+
+/// Cloud Run transcoder host for audio extraction
+const CLOUD_RUN_TRANSCODER_HOST: &str = "divine-transcoder-149672065768.us-central1.run.app";
+
+/// Response from Cloud Run audio extraction endpoint
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AudioExtractionResponse {
+    pub audio_sha256: Option<String>,
+    pub duration: Option<f64>,
+    pub size: Option<u64>,
+    pub mime_type: Option<String>,
+    pub error: Option<String>,
+}
+
+fn parse_funnelcake_audio_reuse_response(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("allow_audio_reuse")
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+fn parse_audio_extraction_error_response(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
+            json.get("error")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
+}
+
+/// Check Funnelcake permission for audio reuse.
+/// Returns Ok(true) if allowed, Ok(false) if denied, Err for unavailability.
+pub fn check_funnelcake_audio_reuse(hash: &str) -> Result<bool> {
+    // In local mode, always allow audio reuse for testing
+    if is_local_mode() {
+        return Ok(true);
+    }
+
+    let funnelcake_url = get_config("funnelcake_api_url").map_err(|_| {
+        BlossomError::Internal("Funnelcake API URL not configured".into())
+    })?;
+
+    let url = format!(
+        "{}/api/videos/by-sha256/{}/audio-reuse",
+        funnelcake_url, hash
+    );
+
+    let mut req = Request::new(Method::GET, &url);
+    // Set Host header from the URL
+    if let Some(host) = funnelcake_url
+        .strip_prefix("https://")
+        .or_else(|| funnelcake_url.strip_prefix("http://"))
+        .and_then(|s| s.split('/').next())
+    {
+        req.set_header("Host", host);
+    }
+
+    let mut resp = req.send(FUNNELCAKE_BACKEND).map_err(|e| {
+        BlossomError::Internal(format!("Funnelcake unavailable: {}", e))
+    })?;
+
+    match resp.get_status() {
+        StatusCode::OK => {
+            let body = resp.take_body().into_string();
+            Ok(parse_funnelcake_audio_reuse_response(&body))
+        }
+        StatusCode::NOT_FOUND => Ok(false),
+        status => Err(BlossomError::Internal(format!(
+            "Funnelcake returned unexpected status: {}",
+            status.as_u16()
+        ))),
+    }
+}
+
+/// Trigger Cloud Run audio extraction endpoint (synchronous - waits for result).
+/// Returns the audio extraction response from Cloud Run.
+pub fn trigger_audio_extraction(hash: &str, owner: &str) -> Result<AudioExtractionResponse> {
+    let webhook_secret = get_secret("webhook_secret").map_err(|_| {
+        BlossomError::Internal("webhook_secret not configured".into())
+    })?;
+
+    let body = serde_json::json!({
+        "sha256": hash,
+        "owner": owner
+    });
+
+    let url = format!("https://{}/audio/extract", CLOUD_RUN_TRANSCODER_HOST);
+    let mut req = Request::new(Method::POST, &url);
+    req.set_header("Host", CLOUD_RUN_TRANSCODER_HOST);
+    req.set_header("Content-Type", "application/json");
+    req.set_header("Authorization", format!("Bearer {}", webhook_secret));
+    req.set_body(body.to_string());
+
+    let mut resp = req.send(CLOUD_RUN_BACKEND).map_err(|e| {
+        BlossomError::Internal(format!("Audio extraction service unavailable: {}", e))
+    })?;
+
+    let status = resp.get_status();
+    let resp_body = resp.take_body().into_string();
+
+    match status {
+        StatusCode::OK => serde_json::from_str::<AudioExtractionResponse>(&resp_body)
+            .map_err(|e| {
+                BlossomError::Internal(format!(
+                    "Failed to parse audio extraction response: {}",
+                    e
+                ))
+            }),
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            let error = parse_audio_extraction_error_response(&resp_body)
+                .unwrap_or_else(|| "extraction_failed".to_string());
+            Ok(AudioExtractionResponse {
+                audio_sha256: None,
+                duration: None,
+                size: None,
+                mime_type: None,
+                error: Some(error),
+            })
+        }
+        _ => Err(BlossomError::Internal(format!(
+            "Audio extraction failed with status: {}",
+            status.as_u16()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_audio_extraction_error_response, parse_funnelcake_audio_reuse_response,
+    };
+
+    #[test]
+    fn parses_funnelcake_audio_reuse_allow_flag() {
+        assert!(parse_funnelcake_audio_reuse_response(
+            r#"{"allow_audio_reuse":true}"#
+        ));
+        assert!(!parse_funnelcake_audio_reuse_response(
+            r#"{"allow_audio_reuse":false}"#
+        ));
+    }
+
+    #[test]
+    fn defaults_funnelcake_audio_reuse_to_false_on_invalid_body() {
+        assert!(!parse_funnelcake_audio_reuse_response("not json"));
+        assert!(!parse_funnelcake_audio_reuse_response(r#"{"unexpected":true}"#));
+    }
+
+    #[test]
+    fn parses_audio_extraction_error_response() {
+        assert_eq!(
+            parse_audio_extraction_error_response(r#"{"error":"no_audio_track"}"#),
+            Some("no_audio_track".to_string())
+        );
+        assert_eq!(parse_audio_extraction_error_response("not json"), None);
+    }
+}

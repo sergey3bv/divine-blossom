@@ -33,6 +33,9 @@ language = "rust"
     [local_server.backends.moderation_api]
     url = "https://moderation-api.divine.video"
 
+    [local_server.backends.funnelcake_api]
+    url = "https://relay.divine.video"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.blossom_metadata]
@@ -45,6 +48,7 @@ language = "rust"
       [local_server.config_stores.blossom_config.contents]
       gcs_bucket = "YOUR_BUCKET_NAME"
       gcs_project_id = "YOUR_GCP_PROJECT_ID"
+      funnelcake_api_url = "https://relay.divine.video"
 
   [local_server.secret_stores]
 
@@ -60,6 +64,7 @@ language = "rust"
 
         [local_server.secret_stores.blossom_secrets.contents.moderation_api_token]
         plaintext = "YOUR_MODERATION_API_BEARER_TOKEN"
+
 
 [setup]
 
@@ -101,6 +106,11 @@ language = "rust"
     address = "moderation-api.divine.video"
     port = 443
 
+    [setup.backends.funnelcake_api]
+    description = "Funnelcake permission API"
+    address = "relay.divine.video"
+    port = 443
+
   [setup.kv_stores]
 
     [setup.kv_stores.blossom_metadata]
@@ -113,6 +123,7 @@ language = "rust"
     items = [
       { key = "gcs_bucket", description = "GCS bucket name" },
       { key = "gcs_project_id", description = "GCP project ID" },
+      { key = "funnelcake_api_url", description = "Funnelcake API base URL" },
     ]
 
   [setup.secret_stores]
