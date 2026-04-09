@@ -2,6 +2,7 @@
 // ABOUTME: Downloads video from GCS, transcodes to HLS with NVENC, uploads segments
 
 use anyhow::{anyhow, Result};
+use base64::Engine as _;
 use axum::{
     extract::State,
     http::{header, Method, StatusCode},
@@ -53,6 +54,12 @@ struct Config {
     transcription_api_key: Option<String>,
     /// Model name for transcription API requests
     transcription_model: String,
+    /// Transcription provider: "gemini" or "openai"
+    transcription_provider: String,
+    /// GCP project ID for Vertex AI (required for Gemini provider)
+    gcp_project_id: String,
+    /// GCP region for Vertex AI
+    gcp_region: String,
     /// URL of the Fastly edge service for transcript status webhook callbacks
     transcript_webhook_url: Option<String>,
     transcription_max_in_flight: usize,
@@ -114,6 +121,12 @@ impl Config {
             transcription_model: lookup("TRANSCRIPTION_MODEL")
                 .or_else(|| lookup("OPENAI_MODEL"))
                 .unwrap_or_else(|| "whisper-1".to_string()),
+            transcription_provider: lookup("TRANSCRIPTION_PROVIDER")
+                .unwrap_or_else(|| "gemini".to_string()),
+            gcp_project_id: lookup("GCP_PROJECT_ID")
+                .unwrap_or_else(|| "rich-compiler-479518-d2".to_string()),
+            gcp_region: lookup("GCP_REGION")
+                .unwrap_or_else(|| "us-central1".to_string()),
             // Transcript webhook URL (defaults to same host + /admin/transcript-status)
             transcript_webhook_url: lookup("TRANSCRIPT_WEBHOOK_URL"),
             transcription_max_in_flight: parse_value(&mut lookup, "TRANSCRIPTION_MAX_IN_FLIGHT", 4)
@@ -2019,6 +2032,11 @@ async fn transcribe_audio_via_provider_once(
     audio_path: &Path,
     language: Option<&str>,
 ) -> std::result::Result<String, ProviderFailure> {
+    if config.transcription_provider == "gemini" {
+        return transcribe_via_gemini(config, audio_path, language).await;
+    }
+
+    // --- OpenAI path (original) ---
     let api_url = config.transcription_api_url.as_ref().ok_or_else(|| {
         parse_provider_status(None, None, "TRANSCRIPTION_API_URL is not configured", false)
     })?;
@@ -2181,6 +2199,196 @@ fn transcription_response_format(model: &str) -> &'static str {
     } else {
         "vtt"
     }
+}
+
+/// Fetch a GCP access token from the metadata server (works on Cloud Run)
+/// or fall back to `gcloud auth print-access-token` locally.
+async fn fetch_gcp_access_token() -> std::result::Result<String, ProviderFailure> {
+    let metadata_url =
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(metadata_url)
+        .header("Metadata-Flavor", "Google")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().await.map_err(|e| {
+                parse_provider_status(
+                    None,
+                    None,
+                    &format!("Failed to read metadata token: {}", e),
+                    false,
+                )
+            })?;
+            let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                parse_provider_status(
+                    None,
+                    None,
+                    &format!("Failed to parse metadata token: {}", e),
+                    false,
+                )
+            })?;
+            json["access_token"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    parse_provider_status(
+                        None,
+                        None,
+                        "No access_token in metadata response",
+                        false,
+                    )
+                })
+        }
+        _ => {
+            // Fallback: try gcloud CLI for local development
+            let output = tokio::process::Command::new("gcloud")
+                .args(["auth", "print-access-token"])
+                .output()
+                .await
+                .map_err(|e| {
+                    parse_provider_status(
+                        None,
+                        None,
+                        &format!("gcloud auth failed: {}", e),
+                        false,
+                    )
+                })?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                Err(parse_provider_status(
+                    None,
+                    None,
+                    "Failed to get GCP access token (no metadata server, gcloud failed)",
+                    false,
+                ))
+            }
+        }
+    }
+}
+
+/// Transcribe audio using Gemini via Vertex AI generateContent.
+/// Returns raw JSON text with segments and timestamps.
+async fn transcribe_via_gemini(
+    config: &Config,
+    audio_path: &Path,
+    _language: Option<&str>,
+) -> std::result::Result<String, ProviderFailure> {
+    let audio_bytes = tokio::fs::read(audio_path).await.map_err(|e| {
+        parse_provider_status(
+            None,
+            None,
+            &format!("Failed to read audio: {}", e),
+            false,
+        )
+    })?;
+    let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);
+
+    let access_token = fetch_gcp_access_token().await?;
+
+    let url = format!(
+        "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+        config.gcp_region, config.gcp_project_id, config.gcp_region, config.transcription_model,
+    );
+
+    let body = serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": "Transcribe this audio. Return every spoken segment with start and end timestamps in seconds and the text. If there is no speech, return an empty segments array."},
+                {"inlineData": {"mimeType": "audio/wav", "data": audio_b64}}
+            ]
+        }],
+        "generationConfig": {
+            "audioTimestamp": true,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "object",
+                "properties": {
+                    "language": {"type": "string"},
+                    "segments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start": {"type": "number"},
+                                "end": {"type": "number"},
+                                "text": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| {
+            parse_provider_status(
+                None,
+                None,
+                &format!("Failed to call Vertex AI: {}", e),
+                e.is_timeout(),
+            )
+        })?;
+
+    let status = response.status();
+    let retry_after_header = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let resp_body = response.text().await.map_err(|e| {
+        parse_provider_status(
+            Some(status.as_u16()),
+            retry_after_header.as_deref(),
+            &format!("Failed to read Vertex AI response: {}", e),
+            e.is_timeout(),
+        )
+    })?;
+
+    if !status.is_success() {
+        return Err(parse_provider_status(
+            Some(status.as_u16()),
+            retry_after_header.as_deref(),
+            &resp_body,
+            false,
+        ));
+    }
+
+    // Extract text from Vertex AI response: candidates[0].content.parts[0].text
+    let resp_json: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+        parse_provider_status(
+            None,
+            None,
+            &format!("Invalid Vertex AI JSON: {}", e),
+            false,
+        )
+    })?;
+
+    resp_json["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            parse_provider_status(
+                None,
+                None,
+                &format!("No text in Vertex AI response: {}", resp_body),
+                false,
+            )
+        })
 }
 
 /// Normalize transcription output to WebVTT and collect summary metadata.
@@ -2523,6 +2731,32 @@ mod tests {
     #[test]
     fn whisper_uses_vtt_response_format() {
         assert_eq!(transcription_response_format("whisper-1"), "vtt");
+    }
+
+    #[test]
+    fn gemini_structured_output_normalizes_to_vtt() {
+        let gemini_json = r#"{
+            "language": "en",
+            "segments": [
+                {"start": 0.0, "end": 2.5, "text": "Hello world"},
+                {"start": 2.5, "end": 5.0, "text": "Testing one two three"}
+            ]
+        }"#;
+        let parsed = normalize_transcript_to_vtt(gemini_json).unwrap();
+        assert!(parsed.content.starts_with("WEBVTT"));
+        assert_eq!(parsed.cue_count, 2);
+        assert_eq!(parsed.language.as_deref(), Some("en"));
+        assert!(parsed.content.contains("Hello world"));
+        assert!(parsed.content.contains("Testing one two three"));
+        assert!(parsed.content.contains("00:00:00.000 --> 00:00:02.500"));
+    }
+
+    #[test]
+    fn gemini_config_defaults_to_gemini_provider() {
+        let config = Config::from_lookup(|_| None);
+        assert_eq!(config.transcription_provider, "gemini");
+        assert_eq!(config.gcp_project_id, "rich-compiler-479518-d2");
+        assert_eq!(config.gcp_region, "us-central1");
     }
 
     #[test]
