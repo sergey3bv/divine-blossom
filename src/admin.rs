@@ -780,10 +780,14 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
     let old_status = metadata.status;
 
-    // Map action to BlobStatus
+    // Map action to BlobStatus.
+    //
+    // AGE_RESTRICT lands on BlobStatus::AgeRestricted, which serves 401 (age gate)
+    // to non-owners. RESTRICT continues to mean the existing 404 shadow-ban.
     let new_status = match moderate_req.action.to_uppercase().as_str() {
         "BAN" | "BLOCK" => BlobStatus::Banned,
         "RESTRICT" => BlobStatus::Restricted,
+        "AGE_RESTRICT" | "AGE_RESTRICTED" => BlobStatus::AgeRestricted,
         "APPROVE" | "ACTIVE" => BlobStatus::Active,
         "PENDING" => BlobStatus::Pending,
         _ => {
@@ -889,11 +893,15 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
 
         match get_blob_metadata(hash) {
             Ok(Some(meta)) => {
-                if meta.status == BlobStatus::Banned || meta.status == BlobStatus::Restricted {
+                if matches!(
+                    meta.status,
+                    BlobStatus::Banned | BlobStatus::Restricted | BlobStatus::AgeRestricted
+                ) {
                     match update_blob_status(hash, BlobStatus::Active) {
                         Ok(()) => {
                             if !skip_purge {
-                                let _ = update_stats_on_status_change(meta.status, BlobStatus::Active);
+                                let _ =
+                                    update_stats_on_status_change(meta.status, BlobStatus::Active);
                                 crate::purge_vcl_cache(hash);
                             }
                             approved += 1;
@@ -912,7 +920,11 @@ pub fn handle_admin_bulk_approve(mut req: Request) -> Result<Response> {
 
     eprintln!(
         "[ADMIN] Bulk approve: {} approved, {} already_ok, {} not_found, {} errors (of {} hashes)",
-        approved, already_ok, not_found, errors, hashes.len()
+        approved,
+        already_ok,
+        not_found,
+        errors,
+        hashes.len()
     );
 
     let response = serde_json::json!({
@@ -949,6 +961,7 @@ pub fn handle_admin_scan_flagged(mut req: Request) -> Result<Response> {
 
     let mut banned: Vec<String> = Vec::new();
     let mut restricted: Vec<String> = Vec::new();
+    let mut age_restricted: Vec<String> = Vec::new();
     let mut active = 0u32;
     let mut pending = 0u32;
     let mut not_found = 0u32;
@@ -961,6 +974,7 @@ pub fn handle_admin_scan_flagged(mut req: Request) -> Result<Response> {
             Ok(Some(meta)) => match meta.status {
                 BlobStatus::Banned => banned.push(hash.clone()),
                 BlobStatus::Restricted => restricted.push(hash.clone()),
+                BlobStatus::AgeRestricted => age_restricted.push(hash.clone()),
                 BlobStatus::Active => active += 1,
                 BlobStatus::Pending => pending += 1,
                 BlobStatus::Deleted => not_found += 1,
@@ -974,6 +988,7 @@ pub fn handle_admin_scan_flagged(mut req: Request) -> Result<Response> {
         "total_scanned": hashes.len(),
         "banned": banned,
         "restricted": restricted,
+        "age_restricted": age_restricted,
         "active": active,
         "pending": pending,
         "not_found": not_found,
@@ -1244,9 +1259,7 @@ pub fn handle_admin_reset_stuck_transcodes(mut req: Request) -> Result<Response>
             };
 
             // Pre-filter cheaply before probing GCS.
-            if meta.transcode_status
-                != Some(crate::blossom::TranscodeStatus::Processing)
-            {
+            if meta.transcode_status != Some(crate::blossom::TranscodeStatus::Processing) {
                 skipped_not_stuck += 1;
                 continue;
             }
@@ -1267,14 +1280,10 @@ pub fn handle_admin_reset_stuck_transcodes(mut req: Request) -> Result<Response>
                 })
                 .unwrap_or(false);
 
-            let is_processing = meta.transcode_status
-                == Some(crate::blossom::TranscodeStatus::Processing);
-            let action = classify_stuck_record(
-                is_processing,
-                &meta.uploaded,
-                &threshold_iso,
-                hls_present,
-            );
+            let is_processing =
+                meta.transcode_status == Some(crate::blossom::TranscodeStatus::Processing);
+            let action =
+                classify_stuck_record(is_processing, &meta.uploaded, &threshold_iso, hls_present);
             eprintln!(
                 "[UNSTICK] hash={} uploaded={} hls_present={} action={:?} dry_run={}",
                 hash, meta.uploaded, hls_present, action, dry_run
