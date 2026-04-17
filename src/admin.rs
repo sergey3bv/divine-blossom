@@ -2,13 +2,15 @@
 // ABOUTME: Provides stats, recent uploads, user lists, OAuth login, and moderation controls
 
 use crate::blossom::{BlobMetadata, BlobStatus, GlobalStats, RecentIndex};
-use crate::delete_policy::{parse_restore_status, restore_soft_deleted_blob};
+use crate::delete_policy::{
+    handle_creator_delete, parse_restore_status, restore_soft_deleted_blob,
+};
 use crate::error::{BlossomError, Result};
 use crate::metadata::{
     get_blob_metadata, get_global_stats, get_recent_index, get_user_blobs, get_user_index,
     replace_global_stats, replace_recent_index, update_blob_status, update_stats_on_status_change,
 };
-use crate::storage::download_blob_with_fallback;
+use crate::storage::{download_blob_with_fallback, write_audit_log};
 use fastly::http::{header, Method, StatusCode};
 use fastly::kv_store::KVStore;
 use fastly::{Request, Response};
@@ -284,7 +286,7 @@ fn create_session(provider: &str, identity: &str) -> Result<String> {
 }
 
 /// Get config value from Fastly config store
-fn get_config(key: &str) -> Option<String> {
+pub(crate) fn get_config(key: &str) -> Option<String> {
     fastly::config_store::ConfigStore::open("blossom_config").get(key)
 }
 
@@ -836,6 +838,8 @@ pub fn handle_admin_blob_content(req: Request, hash: &str) -> Result<Response> {
 struct ModerateRequest {
     sha256: String,
     action: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -863,6 +867,69 @@ pub fn handle_admin_moderate_action(mut req: Request) -> Result<Response> {
     let metadata = get_blob_metadata(&moderate_req.sha256)?
         .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
     let old_status = metadata.status;
+
+    // Creator-delete: thin adapter over handle_creator_delete so /admin/moderate
+    // and /admin/api/moderate produce the same response contract.
+    //
+    // Audit strategy: write `creator_delete_attempt` before the helper call and
+    // `creator_delete` after success. A failure path leaves an attempt entry
+    // without a paired success, which operators can query for directly. This
+    // closes the audit gap that would otherwise exist if a soft-delete
+    // succeeded but the physical byte delete failed (soft-delete is durable
+    // even though we propagate the error to the caller).
+    if moderate_req.action.eq_ignore_ascii_case("DELETE") {
+        let reason = moderate_req
+            .reason
+            .as_deref()
+            .unwrap_or("Creator-initiated deletion via kind 5");
+
+        let physical_delete_enabled =
+            get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
+
+        let meta_json = serde_json::to_string(&metadata).ok();
+
+        write_audit_log(
+            &moderate_req.sha256,
+            "creator_delete_attempt",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
+        let outcome = handle_creator_delete(
+            &moderate_req.sha256,
+            &metadata,
+            reason,
+            physical_delete_enabled,
+        )
+        .map_err(|e| {
+            eprintln!(
+                "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                moderate_req.sha256, e
+            );
+            e
+        })?;
+
+        write_audit_log(
+            &moderate_req.sha256,
+            "creator_delete",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
+        let response = serde_json::json!({
+            "success": true,
+            "sha256": moderate_req.sha256,
+            "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
+            "new_status": "deleted",
+            "physical_deleted": outcome.physical_deleted,
+            "physical_delete_skipped": !outcome.physical_delete_enabled,
+        });
+        return json_response(StatusCode::OK, &response);
+    }
 
     // Map action to BlobStatus.
     //

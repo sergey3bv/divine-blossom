@@ -20,7 +20,7 @@ use crate::blossom::{
     ResumableUploadInitRequest, ResumableUploadInitResponse, SubtitleJob, SubtitleJobCreateRequest,
     SubtitleJobStatus, TranscodeStatus, TranscriptStatus, UploadRequirements,
 };
-use crate::delete_policy::{plan_user_delete, soft_delete_blob, DeletePlan};
+use crate::delete_policy::{handle_creator_delete, plan_user_delete, soft_delete_blob, DeletePlan};
 use crate::error::{BlossomError, Result};
 use crate::media_auth_log::format_media_auth_log;
 use crate::metadata::{
@@ -354,7 +354,7 @@ fn clear_stale_audio_mapping(source_hash: &str, audio_hash: &str) {
     }
 }
 
-fn cleanup_derived_audio_for_source(source_hash: &str) {
+pub(crate) fn cleanup_derived_audio_for_source(source_hash: &str) {
     let mapping = match get_audio_mapping(source_hash) {
         Ok(Some(mapping)) => mapping,
         Ok(None) => return,
@@ -3764,7 +3764,7 @@ fn handle_upload_requirements(req: Request) -> Result<Response> {
 /// Delete all GCS artifacts for a blob (thumbnail, HLS, VTT).
 /// The main blob itself is NOT deleted here (caller handles that).
 /// Best-effort: logs errors but never fails.
-fn delete_blob_gcs_artifacts(hash: &str) {
+pub(crate) fn delete_blob_gcs_artifacts(hash: &str) {
     // Thumbnail
     let _ = storage_delete(&format!("{}.jpg", hash));
 
@@ -4741,6 +4741,68 @@ fn handle_admin_moderate(mut req: Request) -> Result<Response> {
     // Validate sha256 format
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(BlossomError::BadRequest("Invalid sha256 format".into()));
+    }
+
+    // Creator-delete: thin adapter over handle_creator_delete so /admin/moderate
+    // and /admin/api/moderate produce the same response contract.
+    //
+    // Audit strategy: write `creator_delete_attempt` before the helper call and
+    // `creator_delete` after success. A failure path leaves an attempt entry
+    // without a paired success, which operators can query for directly. This
+    // closes the audit gap that would otherwise exist if a soft-delete
+    // succeeded but the physical byte delete failed (soft-delete is durable
+    // even though we propagate the error to the caller).
+    if action.eq_ignore_ascii_case("DELETE") {
+        let metadata = get_blob_metadata(sha256)?
+            .ok_or_else(|| BlossomError::NotFound("Blob not found".into()))?;
+
+        let reason = payload["reason"]
+            .as_str()
+            .unwrap_or("Creator-initiated deletion via kind 5");
+
+        let physical_delete_enabled =
+            crate::admin::get_config("ENABLE_PHYSICAL_DELETE").as_deref() == Some("true");
+
+        let meta_json = serde_json::to_string(&metadata).ok();
+
+        write_audit_log(
+            sha256,
+            "creator_delete_attempt",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
+        let outcome = handle_creator_delete(sha256, &metadata, reason, physical_delete_enabled)
+            .map_err(|e| {
+                eprintln!(
+                    "[CREATOR-DELETE] handle_creator_delete failed for {}: {}",
+                    sha256, e
+                );
+                e
+            })?;
+
+        write_audit_log(
+            sha256,
+            "creator_delete",
+            &metadata.owner,
+            None,
+            meta_json.as_deref(),
+            Some(reason),
+        );
+
+        let response = serde_json::json!({
+            "success": true,
+            "sha256": sha256,
+            "old_status": format!("{:?}", outcome.old_status).to_lowercase(),
+            "new_status": "deleted",
+            "physical_deleted": outcome.physical_deleted,
+            "physical_delete_skipped": !outcome.physical_delete_enabled,
+        });
+        let mut resp = json_response(StatusCode::OK, &response);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
     }
 
     // Map action to BlobStatus.
