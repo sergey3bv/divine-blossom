@@ -5,8 +5,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install c2patool for C2PA validation
-RUN apt-get update && apt-get install -y ca-certificates curl && \
+# Install c2patool for C2PA validation and ffmpeg for thumbnails
+RUN apt-get update && apt-get install -y ca-certificates curl ffmpeg && \
     curl -L https://github.com/contentauth/c2patool/releases/download/v0.26.33/c2patool-v0.26.33-x86_64-unknown-linux-gnu.tar.gz | \
     tar xz -C /usr/local/bin/ && \
     apt-get purge -y curl && apt-get autoremove -y && \
